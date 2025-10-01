@@ -281,4 +281,4 @@ async def points_cmd(ctx):
 # =========================
 # Run the bot
 # =========================
-bot.run("DISCORD_BOT_TOKEN")
+bot.run(os.getenv("DISCORD_BOT_TOKEN"))
