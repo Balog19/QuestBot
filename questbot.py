@@ -18,7 +18,7 @@ SCOPE = [
 ]
 CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
 GCLIENT = gspread.authorize(CREDS)
-SHEET = GCLIENT.open("Tracking Test").worksheet("Points Tracking")
+SHEET = GCLIENT.open("FGN 2.0 Points Tracking (Staff)").worksheet("Points Tracking")
 
 # =========================
 # Discord bot setup
