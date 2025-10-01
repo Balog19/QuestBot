@@ -1,4 +1,6 @@
 import os
+from typing import Union, Optional
+
 import discord
 from discord.ext import commands
 
@@ -23,20 +25,20 @@ SHEET = GCLIENT.open("Tracking Test").worksheet("Points Tracking")
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # needed so mentions resolve properly
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 REQUIRED_ROLE_NAME = "Staff"
 
 # Columns we increment via commands
 POINT_COLUMNS = ["1st Places", "2nd Places", "3rd Places", "Quest", "Bonus", "Participation"]
-POINTS_TOTAL_HEADER = "Points (X Edit)"  # the computed total column
+POINTS_TOTAL_HEADER = "Points (X Edit)"
 
 
 # -------------------------
 # Helpers
 # -------------------------
 def col_to_letter(col: int) -> str:
-    """1 -> A, 27 -> AA, etc."""
     result = ""
     while col > 0:
         col, r = divmod(col - 1, 26)
@@ -45,7 +47,7 @@ def col_to_letter(col: int) -> str:
 
 def header_indexes():
     headers = SHEET.row_values(1)
-    return {h.strip().lower(): i+1 for i, h in enumerate(headers)}
+    return {h.strip().lower(): i + 1 for i, h in enumerate(headers)}
 
 def get_col_index(header_name: str) -> int:
     idx = header_indexes().get(header_name.strip().lower())
@@ -63,8 +65,8 @@ def build_points_formula(row: int) -> str:
 
 def increment_many(members, column_header: str, delta: int = 1):
     """
-    Add points for a set of members in one column.
-    delta = +1 always (only adding for now).
+    Add or subtract 'delta' points for each member in the given column.
+    If member row doesn't exist and delta > 0, a row is created with formatting + totals formula.
     """
     nick_col = get_col_index("Discord Nickname")
     target_col = get_col_index(column_header)
@@ -87,54 +89,62 @@ def increment_many(members, column_header: str, delta: int = 1):
             except (TypeError, ValueError):
                 current = 0
             new_val = current + delta
+            if new_val < 0:
+                new_val = 0  # clamp at zero
             updates.append({
                 "range": f"{col_to_letter(target_col)}{row_idx}",
                 "values": [[new_val]]
             })
         else:
-            # If user doesn’t exist yet, create row
-            new_row = len(nickname_list) + 1
-            body = {
-                "requests": [{
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": SHEET.id,
-                            "dimension": "ROWS",
-                            "startIndex": new_row - 1,
-                            "endIndex": new_row
-                        },
-                        "inheritFromBefore": True
-                    }
-                }]
-            }
-            SHEET.spreadsheet.batch_update(body)
+            # Only create a new row when adding (delta > 0)
+            if delta > 0:
+                new_row = len(nickname_list) + 1
+                body = {
+                    "requests": [{
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": SHEET.id,
+                                "dimension": "ROWS",
+                                "startIndex": new_row - 1,
+                                "endIndex": new_row
+                            },
+                            "inheritFromBefore": True
+                        }
+                    }]
+                }
+                SHEET.spreadsheet.batch_update(body)
 
-            updates.append({
-                "range": f"{col_to_letter(nick_col)}{new_row}",
-                "values": [[nickname]]
-            })
-            updates.append({
-                "range": f"{col_to_letter(get_col_index('Discord Username'))}{new_row}",
-                "values": [[username]]
-            })
-            updates.append({
-                "range": f"{col_to_letter(target_col)}{new_row}",
-                "values": [[1]]
-            })
-            # Reset other point cols
-            for header in POINT_COLUMNS:
-                if header != column_header:
-                    try:
-                        c = get_col_index(header)
-                        updates.append({"range": f"{col_to_letter(c)}{new_row}", "values": [[0]]})
-                    except:
-                        pass
-            # Add formula
-            points_col = get_col_index(POINTS_TOTAL_HEADER)
-            updates.append({
-                "range": f"{col_to_letter(points_col)}{new_row}",
-                "values": [[build_points_formula(new_row)]]
-            })
+                # Nick + Username
+                updates.append({
+                    "range": f"{col_to_letter(nick_col)}{new_row}",
+                    "values": [[nickname]]
+                })
+                updates.append({
+                    "range": f"{col_to_letter(get_col_index('Discord Username'))}{new_row}",
+                    "values": [[username]]
+                })
+
+                # Target column value = delta
+                updates.append({
+                    "range": f"{col_to_letter(target_col)}{new_row}",
+                    "values": [[delta]]
+                })
+
+                # Reset other point columns to 0 for the new row
+                for header in POINT_COLUMNS:
+                    if header != column_header:
+                        try:
+                            c = get_col_index(header)
+                            updates.append({"range": f"{col_to_letter(c)}{new_row}", "values": [[0]]})
+                        except Exception:
+                            pass
+
+                # Add totals formula
+                points_col = get_col_index(POINTS_TOTAL_HEADER)
+                updates.append({
+                    "range": f"{col_to_letter(points_col)}{new_row}",
+                    "values": [[build_points_formula(new_row)]]
+                })
 
     if updates:
         SHEET.batch_update(updates, value_input_option="USER_ENTERED")
@@ -152,24 +162,120 @@ def staff_only():
         return any(r.name == REQUIRED_ROLE_NAME for r in getattr(ctx.author, "roles", []))
     return commands.check(predicate)
 
-def make_point_command(name, header):
+
+# ===== Commands with only ±1 (remove optional) =====
+def make_simple_command(name, header):
     @bot.command(name=name)
     @staff_only()
-    async def cmd(ctx, *members: discord.Member):
+    async def cmd(ctx, first: Union[discord.Member, str, None] = None, *rest: discord.Member):
+        """
+        Usage:
+          !first @User                 -> +1
+          !first remove @User @User2   -> -1 each
+        """
+        members = []
+        delta = 1
+
+        if isinstance(first, str) and first.lower() == "remove":
+            delta = -1
+            members = list(rest)
+        else:
+            if isinstance(first, discord.Member):
+                members = [first] + list(rest)
+            else:
+                members = list(rest)
+
         if not members:
             await ctx.send("No members provided.")
             return
 
-        increment_many(members, header, 1)
-        await ctx.send(f"✅ Added 1 point to {header}.")
+        increment_many(members, header, delta)
+        names = ", ".join(m.display_name for m in members)
+        if delta > 0:
+            await ctx.send(f"✅ Added 1 point to {header} for: {names}")
+        else:
+            await ctx.send(f"✅ Removed 1 point from {header} for: {names}")
 
-# Create all point commands
-make_point_command("first", "1st Places")
-make_point_command("second", "2nd Places")
-make_point_command("third", "3rd Places")
-make_point_command("quest", "Quest")
-make_point_command("bonus", "Bonus")
-make_point_command("participation", "Participation")
+make_simple_command("first", "1st Places")
+make_simple_command("second", "2nd Places")
+make_simple_command("third", "3rd Places")
+make_simple_command("quest", "Quest")
+make_simple_command("participation", "Participation")
+
+
+# ===== BONUS: supports numbers and remove numbers =====
+@bot.command(name="bonus")
+@staff_only()
+async def bonus_cmd(ctx, *args):
+    """
+    Patterns supported:
+      !bonus @User                          -> +1
+      !bonus 5 @User1 @User2               -> +5 each
+      !bonus remove @User                  -> -1
+      !bonus remove 3 @User1 @User2        -> -3 each
+    """
+    if not args:
+        await ctx.send("No members provided.")
+        return
+
+    sign = +1
+    amount = 1
+    i = 0
+
+    # Handle "remove"
+    if args[0].lower() == "remove":
+        sign = -1
+        i += 1
+
+    # Handle number after (optional)
+    if i < len(args) and args[i].isdigit():
+        amount = int(args[i])
+        i += 1
+
+    # Get all mentioned members directly
+    members = ctx.message.mentions
+
+    if not members:
+        await ctx.send("No members provided.")
+        return
+
+    delta = sign * amount
+    increment_many(members, "Bonus", delta)
+
+    names = ", ".join(m.display_name for m in members)
+    if delta > 0:
+        await ctx.send(f"✅ Added {delta} point(s) to Bonus for: {names}")
+    else:
+        await ctx.send(f"✅ Removed {abs(delta)} point(s) from Bonus for: {names}")
+
+
+# ===== POINTS: check your own score (no role required) =====
+@bot.command(name="points")
+async def points_cmd(ctx):
+    """
+    Anyone can use !points to check their own score.
+    """
+    member = ctx.author
+    nickname, username = get_names(member)
+
+    # Column indexes
+    nick_col = get_col_index("Discord Nickname")
+    points_col = get_col_index(POINTS_TOTAL_HEADER)
+
+    # All nicknames in the sheet
+    nickname_list = SHEET.col_values(nick_col)
+
+    if nickname in nickname_list:
+        row_idx = nickname_list.index(nickname) + 1
+        points_val = SHEET.cell(row_idx, points_col).value
+        try:
+            points_val = int(points_val)
+        except (TypeError, ValueError):
+            points_val = 0
+    else:
+        points_val = 0
+
+    await ctx.send(f"{member.display_name}, you currently have **{points_val}** points.")
 
 
 # =========================
